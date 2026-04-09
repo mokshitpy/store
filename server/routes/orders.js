@@ -4,9 +4,21 @@ const db = require('../db/connection');
 const { verifyToken, verifyAdmin } = require('../middleware/auth');
 
 // PLACE ORDER
+// PLACE ORDER
 router.post('/', verifyToken, async (req, res) => {
+  const { address_id, coupon_code } = req.body;
   try {
-    // get user's cart
+    // get address
+    const [addresses] = await db.query(
+      'SELECT * FROM addresses WHERE id = ? AND user_id = ?',
+      [address_id, req.user.id]
+    );
+    if (addresses.length === 0) {
+      return res.status(400).json({ message: 'Please select a delivery address' });
+    }
+    const address = addresses[0];
+
+    // get cart
     const [cartItems] = await db.query(`
       SELECT ci.quantity, p.price, p.id as product_id, p.stock
       FROM cart_items ci
@@ -25,25 +37,70 @@ router.post('/', verifyToken, async (req, res) => {
       }
     }
 
-    // calculate total
-    const total = cartItems.reduce((sum, item) => sum + (item.quantity * parseFloat(item.price)), 0);
+    // calculate subtotal
+    const subtotal = cartItems.reduce((sum, item) => sum + (item.quantity * parseFloat(item.price)), 0);
+
+    // validate coupon if provided
+    let discount = 0;
+    let appliedCoupon = null;
+
+    if (coupon_code) {
+      const [coupons] = await db.query(
+        'SELECT * FROM coupons WHERE code = ? AND is_active = true',
+        [coupon_code.toUpperCase()]
+      );
+      if (coupons.length > 0) {
+        const coupon = coupons[0];
+        if (
+          (!coupon.expires_at || new Date(coupon.expires_at) >= new Date()) &&
+          coupon.used_count < coupon.max_uses &&
+          subtotal >= coupon.min_order
+        ) {
+          if (coupon.type === 'percent') {
+            discount = (subtotal * coupon.value) / 100;
+          } else {
+            discount = coupon.value;
+          }
+          discount = Math.min(discount, subtotal);
+          appliedCoupon = coupon;
+        }
+      }
+    }
+
+    const total = subtotal - discount;
 
     // create order
     const [order] = await db.query(
-      'INSERT INTO orders (user_id, total_amount) VALUES (?, ?)',
-      [req.user.id, total]
+      `INSERT INTO orders 
+        (user_id, total_amount, delivery_name, delivery_phone, delivery_address, 
+        delivery_city, delivery_state, delivery_pincode, coupon_code, discount_amount) 
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.id, total,
+        address.name, address.phone, address.address_line,
+        address.city, address.state, address.pincode,
+        appliedCoupon ? appliedCoupon.code : null,
+        discount
+      ]
     );
 
-    // create order items
+    // create order items and reduce stock
     for (const item of cartItems) {
       await db.query(
         'INSERT INTO order_items (order_id, product_id, quantity, price_at_purchase) VALUES (?, ?, ?, ?)',
         [order.insertId, item.product_id, item.quantity, item.price]
       );
-      // reduce stock
       await db.query(
         'UPDATE products SET stock = stock - ? WHERE id = ?',
         [item.quantity, item.product_id]
+      );
+    }
+
+    // increment coupon usage
+    if (appliedCoupon) {
+      await db.query(
+        'UPDATE coupons SET used_count = used_count + 1 WHERE id = ?',
+        [appliedCoupon.id]
       );
     }
 
@@ -87,6 +144,9 @@ router.get('/', verifyAdmin, async (req, res) => {
   try {
     const [orders] = await db.query(`
       SELECT o.id, o.total_amount, o.status, o.created_at,
+      o.delivery_name, o.delivery_phone, o.delivery_address,
+      o.delivery_city, o.delivery_state, o.delivery_pincode,
+      o.coupon_code, o.discount_amount,
       u.name as user_name, u.email as user_email
       FROM orders o
       JOIN users u ON o.user_id = u.id
